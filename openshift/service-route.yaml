@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: itom-mcp
+  labels:
+    app: itom-mcp
+spec:
+  selector:
+    app: itom-mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# TLS-terminated at the OpenShift router; plain HTTP is redirected to HTTPS.
+# Remove this Route if only in-cluster clients (e.g. Dify in the same cluster) use the server.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: itom-mcp
+  labels:
+    app: itom-mcp
+  annotations:
+    haproxy.router.openshift.io/timeout: 120s
+    # Optional: restrict who can reach the route
+    # haproxy.router.openshift.io/ip_whitelist: "10.0.0.0/8 192.168.0.0/16"
+spec:
+  host: itom-mcp.apps.cluster.example.com      # must also be in MCP_ALLOWED_HOSTS
+  to:
+    kind: Service
+    name: itom-mcp
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

@@ -1,0 +1,8 @@
+# oc apply -k openshift/   (the Secret is created separately, see README)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - configmap.yaml
+  - deployment.yaml
+  - service-route.yaml
+  - networkpolicy.yaml

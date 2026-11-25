@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: itom-mcp
+  labels:
+    app: itom-mcp
+spec:
+  replicas: 2                      # stateless HTTP transport: safe to scale, no sticky sessions
+  selector:
+    matchLabels:
+      app: itom-mcp
+  template:
+    metadata:
+      labels:
+        app: itom-mcp
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: itom-mcp
+          # Replace with your image (internal registry after `oc start-build`, or Quay/Artifactory)
+          image: image-registry.openshift-image-registry.svc:5000/itom-mcp/itom-mcp:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: itom-mcp-config
+          env:
+            - name: MCP_HTTP_HOST
+              value: "0.0.0.0"
+            - name: SERVICENOW_PASSWORD_FILE
+              value: /var/run/secrets/itom-mcp/servicenow-password
+            - name: MCP_AUTH_TOKEN_FILE
+              value: /var/run/secrets/itom-mcp/mcp-auth-token
+            - name: SERVICENOW_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: itom-mcp-secrets
+                  key: servicenow-username
+            # For oauth, also:
+            # - name: SERVICENOW_CLIENT_ID
+            #   valueFrom: {secretKeyRef: {name: itom-mcp-secrets, key: servicenow-client-id}}
+            # - name: SERVICENOW_CLIENT_SECRET_FILE
+            #   value: /var/run/secrets/itom-mcp/servicenow-client-secret
+          volumeMounts:
+            - name: secrets
+              mountPath: /var/run/secrets/itom-mcp
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+      volumes:
+        - name: secrets
+          secret:
+            secretName: itom-mcp-secrets
+            defaultMode: 0440
+        - name: tmp
+          emptyDir: {}

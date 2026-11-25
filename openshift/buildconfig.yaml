@@ -1,0 +1,25 @@
+# In-cluster image build from a local folder (binary build):
+#   oc apply -f openshift/buildconfig.yaml
+#   oc start-build itom-mcp --from-dir=. --follow
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: itom-mcp
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: itom-mcp
+spec:
+  source:
+    type: Binary
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+  output:
+    to:
+      kind: ImageStreamTag
+      name: itom-mcp:latest
+  resources:
+    limits: {cpu: "1", memory: 1Gi}

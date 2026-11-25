@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: itom-mcp-config
+  labels:
+    app: itom-mcp
+data:
+  SERVICENOW_INSTANCE_URL: "https://your-instance.service-now.com"
+  SERVICENOW_AUTH_TYPE: "basic"            # basic | oauth | api_key
+  SERVICENOW_TIMEOUT: "30"
+  # SERVICENOW_ALLOWED_HOSTS: "service-now.com"
+  READ_ONLY: "true"
+  MAX_LIMIT: "200"
+  DEFAULT_LIMIT: "25"
+  RATE_LIMIT_PER_MINUTE: "300"
+  MAX_TRAVERSAL_DEPTH: "3"
+  MAX_TRAVERSAL_NODES: "300"
+  ENABLE_GENERIC_QUERY: "true"
+  LOG_LEVEL: "INFO"
+  # Must equal the Route host (DNS-rebinding / Host header check). Comma list allowed.
+  MCP_ALLOWED_HOSTS: "itom-mcp.apps.cluster.example.com,itom-mcp,itom-mcp:8080"
