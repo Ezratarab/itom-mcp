@@ -17,5 +17,17 @@ data:
   MAX_TRAVERSAL_NODES: "300"
   ENABLE_GENERIC_QUERY: "true"
   LOG_LEVEL: "INFO"
+  MAX_RESPONSE_CHARS: "200000"
+  MAX_CONCURRENCY: "8"                      # parallel calls to ServiceNow per pod
+  AUTH_MAX_FAILURES_PER_MINUTE: "10"        # brute-force lockout per client address
+  # Writes (only if READ_ONLY=false): "elicit" = a human approves in the MCP client.
+  # The stateless HTTP transport cannot elicit, so over HTTP writes stay refused unless you
+  # deliberately set "confirm_flag" (model passes confirm=true; weaker).
+  WRITE_APPROVAL: "elicit"
+  WRITE_RATE_LIMIT_PER_MINUTE: "5"
+  # Trust X-Forwarded-For only from the OpenShift router's network so the lockout sees the
+  # real client IP and clients cannot spoof it. Set to your cluster network CIDR:
+  #   oc get network.config cluster -o jsonpath='{.spec.clusterNetwork[*].cidr}'
+  FORWARDED_ALLOW_IPS: "10.128.0.0/14"
   # Must equal the Route host (DNS-rebinding / Host header check). Comma list allowed.
   MCP_ALLOWED_HOSTS: "itom-mcp.apps.cluster.example.com,itom-mcp,itom-mcp:8080"

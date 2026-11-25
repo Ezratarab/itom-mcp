@@ -22,8 +22,8 @@ class Filter(BaseModel):
     value: Optional[str] = Field(default=None, description="Value (comma list for in/not_in; omit for is_empty/is_not_empty)")
 
 
-def _build(filters: Optional[list[Filter]]) -> QueryBuilder:
-    qb = QueryBuilder()
+def _build(filters: Optional[list[Filter]], table: str) -> QueryBuilder:
+    qb = QueryBuilder(table)
     if filters and len(filters) > 20:
         raise UserError("at most 20 filters")
     for f in filters or []:
@@ -88,11 +88,11 @@ def register(mcp: FastMCP, ctx: Ctx) -> None:
     ) -> dict[str, Any]:
         """Generic read of any allowlisted ITOM table with structured, injection-safe filters. Use when no dedicated tool fits."""
         t = validate_table(table)
-        qb = _build(filters)
+        qb = _build(filters, t)
         if order_by:
             qb.order_by(order_by, descending)
         q = qb.build()
-        field_list = [validate_field(f) for f in (fields or "").split(",") if f.strip()] or None
+        field_list = [validate_field(f, t) for f in (fields or "").split(",") if f.strip()] or None
         if field_list and len(field_list) > 60:
             raise UserError("at most 60 fields")
         lim = sn.clamp_limit(limit)
@@ -107,8 +107,8 @@ def register(mcp: FastMCP, ctx: Ctx) -> None:
     ) -> dict[str, Any]:
         """Count records in an allowlisted ITOM table, optionally grouped by up to 2 fields (Aggregate API)."""
         t = validate_table(table)
-        q = _build(filters).build()
-        groups = [validate_field(g) for g in (group_by or "").split(",") if g.strip()]
+        q = _build(filters, t).build()
+        groups = [validate_field(g, t) for g in (group_by or "").split(",") if g.strip()]
         if len(groups) > 2:
             raise UserError("group_by: at most 2 fields")
         rows = await sn.aggregate(t, q, groups or None)

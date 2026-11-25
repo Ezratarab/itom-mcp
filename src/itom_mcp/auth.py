@@ -77,7 +77,8 @@ class AuthManager:
 
     async def _fetch_token(self) -> None:
         c = self.config
-        assert c.client_id and c.client_secret and c.token_url
+        if not (c.client_id and c.client_secret and c.token_url):
+            raise AuthError("OAuth is not fully configured")
         headers = {
             "Authorization": _basic(c.client_id, c.client_secret.get_secret_value()),
             "Content-Type": "application/x-www-form-urlencoded",

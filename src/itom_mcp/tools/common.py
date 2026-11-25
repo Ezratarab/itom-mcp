@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import time
@@ -10,15 +11,19 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.elicitation import AcceptedElicitation
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel, Field
 
 from itom_mcp.client import ServiceNowClient, SnError, SnResult
 from itom_mcp.config import Settings
 from itom_mcp.security import (
     UNTRUSTED_NOTICE,
+    KeyedRateLimiter,
     QueryBuilder,
     RateLimiter,
+    cap_response,
     SecurityError,
     is_sys_id,
     sanitize_value,
@@ -38,23 +43,78 @@ class UserError(ValueError):
 class Ctx:
     settings: Settings
     sn: ServiceNowClient
-    limiter: RateLimiter
+    limiter: KeyedRateLimiter
+    write_limiter: RateLimiter
     registered: list[str]
     hidden_write_tools: list[str]
 
 
+class WriteApproval(BaseModel):
+    """Schema shown to the human in the MCP client's approval dialog."""
+
+    approve: bool = Field(description="Approve this change in ServiceNow?")
+
+
 # --------------------------------------------------------------------------- decorator
+
+CTX_PARAM = "mcp_ctx"
 
 
 def _summarize_args(kwargs: dict[str, Any]) -> str:
     """Audit-safe argument summary: values truncated, never more than 300 chars."""
     parts = []
     for k, v in kwargs.items():
-        if v is None:
+        if v is None or k == CTX_PARAM:
             continue
         s = json.dumps(v, default=str)
         parts.append(f"{k}={s[:60]}")
     return ", ".join(parts)[:300]
+
+
+def _client_identity(mcp_ctx: Optional[Context]) -> str:
+    """Authenticated client name set by BearerAuthMiddleware (HTTP), else 'local' (stdio)."""
+    if mcp_ctx is None:
+        return "local"
+    try:
+        request = mcp_ctx.request_context.request
+    except Exception:  # noqa: BLE001 - no request context (stdio / tests)
+        return "local"
+    if request is None:
+        return "local"
+    state = getattr(request, "scope", {}).get("state") or {}
+    return str(state.get("itom_client") or "anonymous")
+
+
+def _client_supports_elicitation(mcp_ctx: Optional[Context]) -> bool:
+    try:
+        params = mcp_ctx.request_context.session.client_params  # type: ignore[union-attr]
+        return bool(params and params.capabilities and params.capabilities.elicitation is not None)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _approve_write(ctx: Ctx, mcp_ctx: Optional[Context], tool: str, kwargs: dict[str, Any]) -> None:
+    """
+    Human-in-the-loop for writes. The model cannot approve its own action: with
+    WRITE_APPROVAL=elicit (default) the MCP client asks the human; the model's `confirm`
+    argument is ignored. WRITE_APPROVAL=confirm_flag trusts confirm=true (weaker, opt-in).
+    """
+    ctx.write_limiter.check()
+    if ctx.settings.write_approval == "confirm_flag":
+        if kwargs.get("confirm") is not True:
+            raise UserError("Write action not performed: set confirm=true after the user explicitly approved it.")
+        return
+    if mcp_ctx is None or not _client_supports_elicitation(mcp_ctx):
+        raise UserError(
+            "Write refused: this MCP client cannot show a human approval prompt (elicitation). "
+            "Ask the operator to use a client that supports it, or set WRITE_APPROVAL=confirm_flag."
+        )
+    shown = {k: v for k, v in kwargs.items() if k not in (CTX_PARAM, "confirm") and v is not None}
+    message = f"ServiceNow ITOM MCP wants to run '{tool}' with {json.dumps(shown, default=str)[:800]}. Approve?"
+    result = await mcp_ctx.elicit(message=message, schema=WriteApproval)
+    if not isinstance(result, AcceptedElicitation) or not result.data.approve:
+        raise UserError("Write action was not approved by the user.")
+    kwargs["confirm"] = True
 
 
 def itom_tool(
@@ -65,9 +125,10 @@ def itom_tool(
     title: Optional[str] = None,
 ) -> Callable[[Callable[..., Awaitable[dict[str, Any]]]], Any]:
     """
-    Register an async tool with: rate limiting, audit logging, uniform error handling,
-    output scrubbing and the untrusted-data notice. Write tools are only registered when
-    READ_ONLY=false, and are marked destructive.
+    Register an async tool with: per-client rate limiting, human approval for writes,
+    audit logging (with client identity), uniform error handling, output scrubbing
+    (secrets/PII/hidden Unicode/injection flags), a response-size cap and the
+    untrusted-data notice. Write tools are only registered when READ_ONLY=false.
     """
 
     def deco(fn: Callable[..., Awaitable[dict[str, Any]]]):
@@ -79,14 +140,23 @@ def itom_tool(
         @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
             started = time.monotonic()
+            mcp_ctx: Optional[Context] = kwargs.pop(CTX_PARAM, None)
+            client = _client_identity(mcp_ctx)
             outcome = "ok"
             try:
-                ctx.limiter.check()
+                ctx.limiter.check(client)
+                if write:
+                    await _approve_write(ctx, mcp_ctx, name, kwargs)
                 result = await fn(*args, **kwargs)
-                result = scrub(result, ctx.settings.max_field_chars)
+                warnings: list[str] = []
+                result = scrub(result, ctx.settings.max_field_chars, warnings)
                 if isinstance(result, dict):
                     result.setdefault("success", True)
-                    result["_notice"] = UNTRUSTED_NOTICE
+                    result = {"_notice": UNTRUSTED_NOTICE, **result}
+                    if warnings:
+                        result["_security_warnings"] = warnings[:50]
+                        outcome = f"ok_flagged:{len(warnings)}"
+                    result = cap_response(result, ctx.settings.max_response_chars)
                 return result
             except (SecurityError, UserError) as e:
                 outcome = "rejected"
@@ -101,13 +171,20 @@ def itom_tool(
                 return {"success": False, "error_type": "internal", "message": f"Internal error (ref {ref}). See server logs."}
             finally:
                 audit.info(
-                    "tool=%s write=%s outcome=%s ms=%d args=[%s]",
+                    "client=%s tool=%s write=%s outcome=%s ms=%d args=[%s]",
+                    client,
                     name,
                     write,
                     outcome,
                     int((time.monotonic() - started) * 1000),
                     _summarize_args(kwargs),
                 )
+
+        # Expose an injected MCP Context parameter to FastMCP (hidden from the tool schema).
+        sig = inspect.signature(fn)
+        ctx_param = inspect.Parameter(CTX_PARAM, inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Context)
+        wrapper.__signature__ = sig.replace(parameters=[*sig.parameters.values(), ctx_param])  # type: ignore[attr-defined]
+        wrapper.__annotations__ = {**fn.__annotations__, CTX_PARAM: Context}
 
         annotations = ToolAnnotations(
             title=title,

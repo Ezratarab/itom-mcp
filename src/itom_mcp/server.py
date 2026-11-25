@@ -18,7 +18,7 @@ from starlette.routing import Route
 from itom_mcp import __version__
 from itom_mcp.client import ServiceNowClient
 from itom_mcp.config import ConfigError, Settings
-from itom_mcp.security import RateLimiter, RedactingFilter
+from itom_mcp.security import AuthFailureTracker, KeyedRateLimiter, RateLimiter, RedactingFilter
 from itom_mcp.tools import MODULES
 from itom_mcp.tools.common import Ctx
 
@@ -89,7 +89,8 @@ def build_server(settings: Settings, transport: Optional[httpx.AsyncBaseTranspor
     ctx = Ctx(
         settings=settings,
         sn=ServiceNowClient(settings, transport=transport),
-        limiter=RateLimiter(settings.rate_limit_per_minute),
+        limiter=KeyedRateLimiter(settings.rate_limit_per_minute, "rate limit"),
+        write_limiter=RateLimiter(settings.write_rate_limit_per_minute, "write rate limit"),
         registered=[],
         hidden_write_tools=[],
     )
@@ -106,13 +107,30 @@ def build_server(settings: Settings, transport: Optional[httpx.AsyncBaseTranspor
 # --------------------------------------------------------------------------- HTTP
 
 
-class BearerAuthMiddleware:
-    """Pure ASGI: constant-time bearer check on everything except /healthz; adds security headers."""
+CLIENT_SCOPE_KEY = "itom_client"
 
-    def __init__(self, app, token: Optional[str], exempt: tuple[str, ...] = ("/healthz",)):
+
+class BearerAuthMiddleware:
+    """
+    Pure ASGI middleware:
+      * constant-time bearer check against every configured client token (named clients);
+      * per-address lockout after AUTH_MAX_FAILURES_PER_MINUTE failures (brute force);
+      * records the authenticated client name in scope["state"] for audit / rate limiting;
+      * adds security headers to every response. /healthz is exempt from auth.
+    """
+
+    def __init__(self, app, tokens: dict[str, str], max_failures: int = 10, exempt: tuple[str, ...] = ("/healthz",)):
         self.app = app
-        self._token = token.encode() if token else None
+        self._tokens = [(name, tok.encode()) for name, tok in tokens.items()]
         self._exempt = set(exempt)
+        self._failures = AuthFailureTracker(max_failures)
+
+    def _match(self, presented: bytes) -> Optional[str]:
+        found = None
+        for name, tok in self._tokens:  # compare against all tokens: no early exit timing
+            if hmac.compare_digest(presented, tok):
+                found = name
+        return found
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -127,50 +145,75 @@ class BearerAuthMiddleware:
                     (b"cache-control", b"no-store"),
                     (b"x-frame-options", b"DENY"),
                     (b"referrer-policy", b"no-referrer"),
+                    (b"content-security-policy", b"default-src 'none'; frame-ancestors 'none'"),
                 ]
                 message["headers"] = headers
             await send(message)
 
-        if self._token is not None and scope.get("path") not in self._exempt:
-            auth = ""
-            for k, v in scope.get("headers", []):
-                if k == b"authorization":
-                    auth = v.decode("latin-1")
-                    break
-            scheme, _, value = auth.partition(" ")
-            if scheme.lower() != "bearer" or not hmac.compare_digest(value.strip().encode(), self._token):
-                logger.warning("Rejected unauthenticated request to %s", scope.get("path"))
-                await send_with_headers({
-                    "type": "http.response.start", "status": 401,
-                    "headers": [(b"content-type", b"application/json"), (b"www-authenticate", b"Bearer")],
-                })
-                await send_with_headers({"type": "http.response.body", "body": b'{"error":"unauthorized"}'})
-                return
+        async def reject(status: int, body: bytes, extra: list[tuple[bytes, bytes]] = ()):
+            await send_with_headers({
+                "type": "http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json"), *extra],
+            })
+            await send_with_headers({"type": "http.response.body", "body": body})
+
+        state = scope.setdefault("state", {})
+        if scope.get("path") in self._exempt:
+            await self.app(scope, receive, send_with_headers)
+            return
+        if not self._tokens:
+            state[CLIENT_SCOPE_KEY] = "anonymous"
+            await self.app(scope, receive, send_with_headers)
+            return
+
+        addr = (scope.get("client") or ("unknown", 0))[0]
+        if self._failures.locked(addr):
+            logger.warning("Auth lockout active for %s", addr)
+            await reject(429, b'{"error":"too many failed authentication attempts"}', [(b"retry-after", b"60")])
+            return
+        auth = ""
+        for k, v in scope.get("headers", []):
+            if k == b"authorization":
+                auth = v.decode("latin-1")
+                break
+        scheme, _, value = auth.partition(" ")
+        client = self._match(value.strip().encode()) if scheme.lower() == "bearer" else None
+        if client is None:
+            self._failures.fail(addr)
+            logger.warning("Rejected unauthenticated request to %s from %s", scope.get("path"), addr)
+            await reject(401, b'{"error":"unauthorized"}', [(b"www-authenticate", b"Bearer")])
+            return
+        state[CLIENT_SCOPE_KEY] = client
         await self.app(scope, receive, send_with_headers)
 
 
-def check_http_security(settings: Settings) -> Optional[str]:
-    """Return the bearer token to enforce, or raise ConfigError for an unsafe setup."""
-    token = settings.mcp_auth_token.get_secret_value() if settings.mcp_auth_token else None
-    if token and len(token) < MIN_TOKEN_LEN:
-        raise ConfigError(f"MCP_AUTH_TOKEN must be at least {MIN_TOKEN_LEN} characters (use: openssl rand -hex 32)")
-    if not token:
+def check_http_security(settings: Settings) -> dict[str, str]:
+    """Return {client_name: token} to enforce, or raise ConfigError for an unsafe setup."""
+    tokens = {n: t.get_secret_value() for n, t in settings.mcp_client_tokens.items()}
+    for name, tok in tokens.items():
+        if len(tok) < MIN_TOKEN_LEN:
+            raise ConfigError(f"token for client {name!r} must be at least {MIN_TOKEN_LEN} characters (openssl rand -hex 32)")
+    if len(set(tokens.values())) != len(tokens):
+        raise ConfigError("two clients share the same token")
+    if not tokens:
         if not _is_loopback(settings.http_host) and not settings.allow_unauthenticated_http:
             raise ConfigError(
-                "Refusing to serve HTTP on a non-loopback address without MCP_AUTH_TOKEN. "
-                "Set MCP_AUTH_TOKEN (recommended) or MCP_ALLOW_UNAUTHENTICATED=true."
+                "Refusing to serve HTTP on a non-loopback address without MCP_AUTH_TOKEN / "
+                "MCP_AUTH_TOKENS_FILE. Set one (recommended) or MCP_ALLOW_UNAUTHENTICATED=true."
             )
-        logger.warning("MCP_AUTH_TOKEN not set: HTTP endpoint is UNAUTHENTICATED.")
-    return token
+        logger.warning("No MCP client tokens configured: HTTP endpoint is UNAUTHENTICATED.")
+    else:
+        logger.info("HTTP bearer auth enabled for %d client(s): %s", len(tokens), ", ".join(sorted(tokens)))
+    return tokens
 
 
 def build_http_app(mcp: FastMCP, settings: Settings):
-    token = check_http_security(settings)
+    tokens = check_http_security(settings)
     app = mcp.streamable_http_app()
 
     async def healthz(_: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok", "version": __version__})
+        return JSONResponse({"status": "ok"})
 
     app.router.routes.insert(0, Route("/healthz", healthz, methods=["GET"]))
     app.debug = False
-    return BearerAuthMiddleware(app, token)
+    return BearerAuthMiddleware(app, tokens, settings.auth_max_failures)

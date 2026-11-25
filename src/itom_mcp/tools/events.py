@@ -219,15 +219,17 @@ def register(mcp: FastMCP, ctx: Ctx) -> None:
     # ---------------------------------------------------------------- write (READ_ONLY=false only)
 
     def _confirm(confirm: bool) -> None:
+        # Defence in depth: the itom_tool wrapper already obtained human approval
+        # (elicitation) or checked confirm=true, and sets confirm=True only then.
         if confirm is not True:
-            raise UserError("Write action not performed: set confirm=true after the user explicitly approved it.")
+            raise UserError("Write action not approved.")
 
     @itom_tool(mcp, ctx, write=True, title="Acknowledge alert")
     async def alert_acknowledge(
         alert: Annotated[str, Field(description="Alert number or sys_id")],
-        confirm: Annotated[bool, Field(description="Must be true; only after explicit user approval")] = False,
+        confirm: Annotated[bool, Field(description="Only used when WRITE_APPROVAL=confirm_flag; otherwise the human approves in the client")] = False,
     ) -> dict[str, Any]:
-        """[WRITE] Acknowledge an alert. Requires READ_ONLY=false and confirm=true."""
+        """[WRITE] Acknowledge an alert. Requires READ_ONLY=false and human approval."""
         _confirm(confirm)
         rec = await _resolve_alert(alert)
         updated = await sn.patch("em_alert", rec["sys_id"], {"acknowledged": "true"})
@@ -237,9 +239,9 @@ def register(mcp: FastMCP, ctx: Ctx) -> None:
     async def alert_close(
         alert: Annotated[str, Field(description="Alert number or sys_id")],
         work_note: Annotated[str, Field(description="Reason for closing (required, max 2000 chars)", max_length=2000)],
-        confirm: Annotated[bool, Field(description="Must be true; only after explicit user approval")] = False,
+        confirm: Annotated[bool, Field(description="Only used when WRITE_APPROVAL=confirm_flag; otherwise the human approves in the client")] = False,
     ) -> dict[str, Any]:
-        """[WRITE] Close an alert with a work note. Requires READ_ONLY=false and confirm=true."""
+        """[WRITE] Close an alert with a work note. Requires READ_ONLY=false and human approval."""
         _confirm(confirm)
         note = sanitize_value(work_note, field="work_note", max_len=2000)
         rec = await _resolve_alert(alert)
@@ -250,9 +252,9 @@ def register(mcp: FastMCP, ctx: Ctx) -> None:
     async def alert_add_work_note(
         alert: Annotated[str, Field(description="Alert number or sys_id")],
         work_note: Annotated[str, Field(max_length=2000)],
-        confirm: Annotated[bool, Field(description="Must be true; only after explicit user approval")] = False,
+        confirm: Annotated[bool, Field(description="Only used when WRITE_APPROVAL=confirm_flag; otherwise the human approves in the client")] = False,
     ) -> dict[str, Any]:
-        """[WRITE] Add a work note to an alert. Requires READ_ONLY=false and confirm=true."""
+        """[WRITE] Add a work note to an alert. Requires READ_ONLY=false and human approval."""
         _confirm(confirm)
         note = sanitize_value(work_note, field="work_note", max_len=2000)
         rec = await _resolve_alert(alert)

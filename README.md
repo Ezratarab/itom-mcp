@@ -4,9 +4,9 @@ An MCP server that answers ServiceNow **IT Operations Management** questions:
 CMDB, Discovery, MID Servers, Event Management, Service Mapping, and the operational
 context of a CI (incidents, problems, changes, outages).
 
-- **Read-only by default.** Write tools are opt-in and need explicit confirmation.
+- **Read-only by default.** Write tools are opt-in, and a **human** approves every write in the MCP client.
 - **Same ServiceNow authentication as [oricohen392/mcp-snow](https://github.com/oricohen392/mcp-snow):** `basic`, `oauth` (client_credentials, falling back to the password grant) and `api_key`, with the same environment variables.
-- **Hardened against the known MCP/ServiceNow security problems.** See [SECURITY.md](SECURITY.md).
+- **Hardened against prompt injection, query injection, data leakage and endpoint abuse.** See [SECURITY.md](SECURITY.md) for the threat model and [ARCHITECTURE.md](ARCHITECTURE.md) for how it fits together.
 - **Two transports.** `stdio` for Claude Desktop / Claude Code, and stateless streamable **HTTP** (`/mcp`) for OpenShift.
 
 ---
@@ -25,9 +25,9 @@ context of a CI (incidents, problems, changes, outages).
 | Operations | `ci_operational_summary`, `outages_list` | "Give me everything about web-01: alerts, incidents, changes, outages." |
 | Generic (safe) | `list_itom_tables`, `itom_query`, `itom_count` | Anything else on an allowlisted ITOM table, with structured filters only |
 | Diagnostics | `check_access` | "Can the integration user read everything it needs?" |
-| Write (opt-in) | `alert_acknowledge`, `alert_close`, `alert_add_work_note` | Only with `READ_ONLY=false` **and** `confirm=true` |
+| Write (opt-in) | `alert_acknowledge`, `alert_close`, `alert_add_work_note` | Only with `READ_ONLY=false`, **and** the human approves each call (see `WRITE_APPROVAL`) |
 
-Every tool accepts CIs by **sys_id, exact name, IP or FQDN**. Dates can be ISO-8601 or relative (`30m`, `24h`, `7d`). List results include `query_used`, `total_count`, `returned` and `next_offset`.
+Every tool accepts CIs by **sys_id, exact name, IP or FQDN**. Dates can be ISO-8601 or relative (`30m`, `24h`, `7d`). List results include `query_used`, `total_count`, `returned` and `next_offset`. Every result starts with an `_notice` that the data is untrusted, and carries `_security_warnings` when hidden or injected content was neutralised.
 
 ---
 
@@ -50,12 +50,19 @@ All settings come from environment variables (or a `.env` file locally). Every s
 | `MAX_LIMIT` / `DEFAULT_LIMIT` | `200` / `25` | page size |
 | `MAX_TRAVERSAL_DEPTH` / `MAX_TRAVERSAL_NODES` | `3` / `300` | bounds for impact analysis |
 | `MAX_FIELD_CHARS` | `4000` | longer strings are truncated |
-| `RATE_LIMIT_PER_MINUTE` | `120` | per process |
+| `MAX_RESPONSE_CHARS` | `200000` | whole-response cap; trailing records are dropped with a notice |
+| `RATE_LIMIT_PER_MINUTE` | `120` | per client |
+| `WRITE_RATE_LIMIT_PER_MINUTE` | `5` | writes only |
+| `WRITE_APPROVAL` | `elicit` | `elicit`: the human approves in the MCP client and the model's `confirm` is ignored. `confirm_flag`: the model passes `confirm=true` (weaker; needed for clients without elicitation, including stateless HTTP) |
+| `MAX_CONCURRENCY` | `8` | parallel requests to ServiceNow |
 | `ENABLE_GENERIC_QUERY` | `true` | `itom_query` / `itom_count` |
 | `LOG_LEVEL` | `INFO` | logs go to stderr, redacted |
-| `MCP_AUTH_TOKEN` | | **required** for HTTP on non-loopback; ≥ 32 characters |
-| `MCP_HTTP_HOST` / `MCP_HTTP_PORT` | `127.0.0.1` / `8080` | |
-| `MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS` | | Host-header allowlist (set it to the Route host) |
+| `MCP_AUTH_TOKENS_FILE` | | **recommended for HTTP**: one `client-name:token` per line, for per-client audit and limits |
+| `MCP_AUTH_TOKEN` | | single shared token (client name `default`) |
+| `AUTH_MAX_FAILURES_PER_MINUTE` | `10` | brute-force lockout per client address |
+| `MCP_HTTP_HOST` / `MCP_HTTP_PORT` | `127.0.0.1` / `8080` | HTTP refuses non-loopback binds without tokens (≥ 32 characters) |
+| `MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS` | | Host-header / browser-Origin allowlist (set to the Route host) |
+| `FORWARDED_ALLOW_IPS` | `127.0.0.1` | proxies trusted for `X-Forwarded-For` (OpenShift: the cluster network CIDR) |
 
 ---
 
@@ -143,20 +150,27 @@ For an air-gapped cluster, push the image to the internal mirror registry the sa
 
 ### 4. Create the secret (never commit it)
 
-Generate the token the clients will use:
+Generate one token **per MCP client** with the OS's cryptographic random generator (do not use `Get-Random`; it is not secure):
 
 ```powershell
-$token = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
+function New-McpToken { $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | ForEach-Object { '{0:x2}' -f $_ }) }
+```
+```powershell
+"claude-desktop:$(New-McpToken)`ndify:$(New-McpToken)" | Set-Content -NoNewline -Encoding ascii tokens.txt
 ```
 
-Create the secret:
+Create the secret, then delete the local file:
 
 ```powershell
-oc create secret generic itom-mcp-secrets --from-literal=servicenow-username=itom.mcp.integration --from-literal=servicenow-password='<password>' --from-literal=mcp-auth-token=$token
+oc create secret generic itom-mcp-secrets --from-literal=servicenow-username=itom.mcp.integration --from-literal=servicenow-password='<password>' --from-file=mcp-auth-tokens=tokens.txt
+```
+```powershell
+Get-Content tokens.txt; Remove-Item tokens.txt
 ```
 
+Give each client only its own token. The client name shows up in the audit log, and each client has its own rate limit.
 For OAuth, also add `--from-literal=servicenow-client-id=... --from-literal=servicenow-client-secret=...`, then uncomment the OAuth lines in `deployment.yaml`.
-Keep `$token`: clients need it. If you use a vault, create the same keys with External Secrets / Sealed Secrets instead.
+If you use a vault, create the same keys with External Secrets / Sealed Secrets instead.
 
 ### 5. Edit the configuration
 
@@ -164,6 +178,7 @@ Keep `$token`: clients need it. If you use a vault, create the same keys with Ex
   - `SERVICENOW_INSTANCE_URL`, `SERVICENOW_AUTH_TYPE`
   - `MCP_ALLOWED_HOSTS`: the Route host from step 6, plus `itom-mcp,itom-mcp:8080` for in-cluster clients
   - `SERVICENOW_ALLOWED_HOSTS` if you use a custom domain
+  - `FORWARDED_ALLOW_IPS`: your cluster network CIDR (`oc get network.config cluster -o jsonpath='{.spec.clusterNetwork[*].cidr}'`), so brute-force lockout sees real client IPs
 - `openshift/service-route.yaml`: set `spec.host` to your Route host (for example `itom-mcp.apps.<cluster-domain>`). Delete the Route if only in-cluster clients will connect.
 - Private CA for ServiceNow or an egress proxy: mount the CA and set `CA_BUNDLE`, and/or set `HTTPS_PROXY` / `NO_PROXY` in the Deployment env.
 
@@ -194,14 +209,15 @@ This should return `{"status":"ok"}`. Then check that authentication is enforced
 curl.exe -i -X POST https://itom-mcp.apps.<cluster-domain>/mcp
 ```
 
-Finally, connect a client with `Authorization: Bearer <token>` and run the `check_access` tool. It reports which ITOM tables the integration user can read.
+Finally, connect a client with `Authorization: Bearer <its token>` and run the `check_access` tool. It reports which ITOM tables the integration user can read.
 
 ### 8. Operate
 
 - **Scale:** `oc scale deployment/itom-mcp --replicas=3`. The HTTP transport is stateless, so no sticky sessions are needed.
-- **Rotate the MCP token or ServiceNow password:** update the secret, then run `oc rollout restart deployment/itom-mcp`.
+- **Add, rotate or revoke a client:** edit the `mcp-auth-tokens` key of the secret, then run `oc rollout restart deployment/itom-mcp`. Rotate the ServiceNow password the same way.
 - **Audit:** `oc logs deployment/itom-mcp | Select-String itom_mcp.audit`.
-- **Enable alert actions:** set `READ_ONLY: "false"` in the ConfigMap and restart. Only do this if the integration user has the matching role and you want the model to act.
+- **Enable alert actions:** set `READ_ONLY: "false"` in the ConfigMap and restart. With the default `WRITE_APPROVAL=elicit`, writes over the stateless HTTP transport are refused, because a human cannot be asked to approve them there. Only set `WRITE_APPROVAL=confirm_flag` if you accept that the model approves its own writes.
+- **Watch for attacks:** alert on audit lines with `outcome=rejected` bursts or `outcome=ok_flagged` (neutralised prompt injection).
 
 ---
 
@@ -215,8 +231,10 @@ src/itom_mcp/
   security.py    sanitizing, query builder, allowlists, scrubbing, redaction, rate limit
   server.py      FastMCP assembly, logging, HTTP app + bearer auth
   tools/         cmdb, discovery (+MID/ECC), events, services (+CI ops), generic (+check_access)
-tests/           103 tests: injection, auth, redirects, redaction, HTTP auth, tools
+tests/           136 tests: injection, prompt injection, PII, auth, redirects, redaction, HTTP abuse, approvals
 openshift/       BuildConfig, ConfigMap, Secret example, Deployment, Service/Route, NetworkPolicy+PDB
+requirements.lock  hash-pinned runtime deps used by the image
+.github/         CI (tests, bandit, pip-audit, gitleaks, hidden-Unicode check) + Dependabot
 ```
 
 ## Limitations

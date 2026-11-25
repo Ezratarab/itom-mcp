@@ -51,7 +51,7 @@ def main(argv: list[str] | None = None) -> None:
                 log_level=settings.log_level.lower(),
                 server_header=False,
                 proxy_headers=True,
-                forwarded_allow_ips="*",
+                forwarded_allow_ips=settings.forwarded_allow_ips,
                 timeout_keep_alive=30,
             )
     except ConfigError as e:

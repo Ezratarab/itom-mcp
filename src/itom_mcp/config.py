@@ -78,6 +78,17 @@ class Settings:
     mcp_allowed_hosts: tuple[str, ...] = field(default_factory=tuple)
     mcp_allowed_origins: tuple[str, ...] = field(default_factory=tuple)
     allow_unauthenticated_http: bool = False
+    # Named client tokens {name: SecretStr}; MCP_AUTH_TOKEN becomes client "default".
+    mcp_client_tokens: dict[str, SecretStr] = field(default_factory=dict)
+    forwarded_allow_ips: str = "127.0.0.1"
+    auth_max_failures: int = 10
+    # Abuse / blast-radius limits
+    max_concurrency: int = 8
+    max_response_chars: int = 200_000
+    write_rate_limit_per_minute: int = 5
+    # How write tools are approved: "elicit" (human approves in the MCP client) or
+    # "confirm_flag" (the model passes confirm=true; weaker, opt-in).
+    write_approval: str = "elicit"
 
     @property
     def api_base(self) -> str:
@@ -242,6 +253,31 @@ def load_settings(env: Optional[dict[str, str]] = None) -> Settings:
     default_limit = _int("DEFAULT_LIMIT", env, 25, 1, 1000)
     max_limit = _int("MAX_LIMIT", env, 200, 1, 1000)
 
+    tokens: dict[str, SecretStr] = {}
+    default_token = _secret("MCP_AUTH_TOKEN", env)
+    if default_token:
+        tokens["default"] = default_token
+    tokens_file = _env("MCP_AUTH_TOKENS_FILE", env)
+    if tokens_file:
+        tp = Path(tokens_file)
+        if not tp.is_file():
+            raise ConfigError("MCP_AUTH_TOKENS_FILE points to a missing file")
+        for n, line in enumerate(tp.read_text(encoding="utf-8").splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            name, sep, tok = line.partition(":")
+            name, tok = name.strip(), tok.strip()
+            if not sep or not name or not tok or not name.replace("-", "").replace("_", "").isalnum():
+                raise ConfigError(f"MCP_AUTH_TOKENS_FILE line {n}: expected '<client-name>:<token>'")
+            if name in tokens:
+                raise ConfigError(f"MCP_AUTH_TOKENS_FILE: duplicate client name {name!r}")
+            tokens[name] = SecretStr(tok)
+
+    write_approval = (_env("WRITE_APPROVAL", env) or "elicit").lower()
+    if write_approval not in ("elicit", "confirm_flag"):
+        raise ConfigError("WRITE_APPROVAL must be elicit or confirm_flag")
+
     return Settings(
         instance_url=instance_url,
         auth=auth,
@@ -262,4 +298,11 @@ def load_settings(env: Optional[dict[str, str]] = None) -> Settings:
         mcp_allowed_hosts=_csv("MCP_ALLOWED_HOSTS", env),
         mcp_allowed_origins=_csv("MCP_ALLOWED_ORIGINS", env),
         allow_unauthenticated_http=_bool("MCP_ALLOW_UNAUTHENTICATED", env, False),
+        mcp_client_tokens=tokens,
+        forwarded_allow_ips=_env("FORWARDED_ALLOW_IPS", env) or "127.0.0.1",
+        auth_max_failures=_int("AUTH_MAX_FAILURES_PER_MINUTE", env, 10, 1, 10000),
+        max_concurrency=_int("MAX_CONCURRENCY", env, 8, 1, 100),
+        max_response_chars=_int("MAX_RESPONSE_CHARS", env, 200_000, 10_000, 5_000_000),
+        write_rate_limit_per_minute=_int("WRITE_RATE_LIMIT_PER_MINUTE", env, 5, 1, 1000),
+        write_approval=write_approval,
     )

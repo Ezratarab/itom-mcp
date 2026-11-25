@@ -125,7 +125,7 @@ async def test_write_tools_hidden_in_read_only():
 @respx.mock
 async def test_write_tool_requires_confirm():
     route = respx.patch(url__startswith=API).mock(return_value=httpx.Response(200, json={"result": {}}))
-    mcp, _ = server(READ_ONLY="false")
+    mcp, _ = server(READ_ONLY="false", WRITE_APPROVAL="confirm_flag")
     out = await call(mcp, "alert_acknowledge", {"alert": "Alert0001"})
     assert out["success"] is False and "confirm=true" in out["message"]
     assert not route.called
@@ -135,7 +135,7 @@ async def test_write_tool_requires_confirm():
 async def test_write_tool_with_confirm():
     respx.get(f"{API}/table/em_alert").mock(return_value=httpx.Response(200, json={"result": [{"sys_id": SID, "number": "Alert0001"}]}))
     patch = respx.patch(f"{API}/table/em_alert/{SID}").mock(return_value=httpx.Response(200, json={"result": {"number": "Alert0001", "state": "Open", "acknowledged": "true"}}))
-    mcp, _ = server(READ_ONLY="false")
+    mcp, _ = server(READ_ONLY="false", WRITE_APPROVAL="confirm_flag")
     out = await call(mcp, "alert_acknowledge", {"alert": "Alert0001", "confirm": True})
     assert out["updated"]["acknowledged"] == "true" and patch.called
 

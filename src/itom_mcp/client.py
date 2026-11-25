@@ -25,7 +25,7 @@ import httpx
 
 from itom_mcp.auth import AuthError, AuthManager
 from itom_mcp.config import Settings
-from itom_mcp.security import validate_field, validate_sys_id, validate_table
+from itom_mcp.security import TABLE_DENIED_FIELDS, validate_field, validate_sys_id, validate_table
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,8 @@ class ServiceNowClient:
             headers={"User-Agent": "itom-mcp/1.0"},
         )
         self.auth = AuthManager(settings.auth, self._http)
+        # Bound concurrent calls to ServiceNow (protects the instance and its rate limits).
+        self._sem = asyncio.Semaphore(settings.max_concurrency)
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -133,7 +135,8 @@ class ServiceNowClient:
                 headers["Content-Type"] = "application/json"
             started = time.monotonic()
             try:
-                resp = await self._http.request(method, url, params=params, json=json, headers=headers)
+                async with self._sem:
+                    resp = await self._http.request(method, url, params=params, json=json, headers=headers)
             except httpx.TimeoutException:
                 raise SnError("timeout") from None
             except httpx.TransportError as e:
@@ -195,12 +198,15 @@ class ServiceNowClient:
         if query:
             params["sysparm_query"] = query
         if fields:
-            params["sysparm_fields"] = ",".join(validate_field(f) for f in fields)
+            params["sysparm_fields"] = ",".join(validate_field(f, t) for f in fields)
         started = time.monotonic()
         resp = await self._request("GET", f"table/{t}", params=params)
         body = self._json(resp)
         result = body.get("result", []) if isinstance(body, dict) else []
         records = [result] if isinstance(result, dict) else (result if isinstance(result, list) else [])
+        denied = TABLE_DENIED_FIELDS.get(t)
+        if denied:
+            records = [{k: v for k, v in r.items() if k.split(".")[0] not in denied} for r in records if isinstance(r, dict)]
         total = resp.headers.get("X-Total-Count")
         return SnResult(
             records=records,
@@ -213,18 +219,21 @@ class ServiceNowClient:
         sid = validate_sys_id(sys_id)
         params: dict[str, Any] = {"sysparm_display_value": display_value, "sysparm_exclude_reference_link": "true"}
         if fields:
-            params["sysparm_fields"] = ",".join(validate_field(f) for f in fields)
+            params["sysparm_fields"] = ",".join(validate_field(f, t) for f in fields)
         resp = await self._request("GET", f"table/{t}/{sid}", params=params)
         body = self._json(resp)
         result = body.get("result") if isinstance(body, dict) else None
-        return result if isinstance(result, dict) else {}
+        if not isinstance(result, dict):
+            return {}
+        denied = TABLE_DENIED_FIELDS.get(t, frozenset())
+        return {k: v for k, v in result.items() if k.split(".")[0] not in denied}
 
     async def patch(self, table: str, sys_id: str, data: dict[str, Any]) -> dict[str, Any]:
         if self.settings.read_only:
             raise SnError("http_error", detail="server is in READ_ONLY mode")
         t = validate_table(table)
         sid = validate_sys_id(sys_id)
-        clean = {validate_field(k): v for k, v in data.items()}
+        clean = {validate_field(k, t): v for k, v in data.items()}
         resp = await self._request(
             "PATCH", f"table/{t}/{sid}", params={"sysparm_display_value": "true"}, json=clean
         )
@@ -241,7 +250,7 @@ class ServiceNowClient:
         if query:
             params["sysparm_query"] = query
         if group_by:
-            params["sysparm_group_by"] = ",".join(validate_field(g) for g in group_by)
+            params["sysparm_group_by"] = ",".join(validate_field(g, t) for g in group_by)
         resp = await self._request("GET", f"stats/{t}", params=params)
         body = self._json(resp)
         result = body.get("result") if isinstance(body, dict) else None
